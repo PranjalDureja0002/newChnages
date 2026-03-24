@@ -28,10 +28,15 @@ OLD_USER = os.getenv("ORACLE_OLD_USER", USER)
 OLD_PASSWORD = os.getenv("ORACLE_OLD_PASSWORD", PASSWORD)
 ENABLE_OLD_VIEW_COMPARISON = True  # Set to False to skip old view comparison
 
-# ── View Names (CHANGE THESE after running Step 0) ─────────────────────────
-VIEW_1 = "VW_DIRECT_SPEND"      # << REPLACE with actual Direct Spend view name
-VIEW_2 = "VW_INDIRECT_SPEND"    # << REPLACE with actual Indirect Spend view name
-OLD_VIEW = "VW_SPEND_REPORT_VIEW"
+# ── View Names ─────────────────────────────────────────────────────────────
+SCHEMA = "PISVIEW"                   # Oracle schema that owns the new views
+VIEW_1 = "VW_DIRECT_SPEND_ALL"      # Direct Spend view (unqualified for metadata)
+VIEW_2 = "VW_INDIRECT_SPEND_ALL"    # Indirect Spend view
+OLD_VIEW = "VW_SPEND_REPORT_VIEW"   # Old view (on old instance, no schema prefix needed)
+
+# Fully qualified names for data queries (FROM clauses)
+FQ_VIEW_1 = f"{SCHEMA}.{VIEW_1}"
+FQ_VIEW_2 = f"{SCHEMA}.{VIEW_2}"
 
 # Date filter (same as your pipeline's mandatory filter)
 DATE_FILTER = "INVOICE_DATE >= DATE '2024-04-01'"
@@ -57,7 +62,7 @@ def query(conn, sql):
         rows = cur.fetchall() if cols else []
         return cols, rows
     except Exception as e:
-        return [], [(str(e),)]
+        return ["ERROR"], [(str(e),)]
     finally:
         cur.close()
 
@@ -98,26 +103,27 @@ def main():
     report_path = os.path.join(os.path.dirname(__file__), "explore_results.txt")
     f = open(report_path, "w", encoding="utf-8")
 
-    # Step 0: Find spend-related views
+    # Step 0: Find spend-related views in the PISVIEW schema
     print_table(
-        "STEP 0: All views with SPEND/DIRECT/INDIRECT in name",
-        *query(conn, """
-            SELECT view_name FROM user_views
-            WHERE UPPER(view_name) LIKE '%SPEND%'
-               OR UPPER(view_name) LIKE '%DIRECT%'
-               OR UPPER(view_name) LIKE '%INDIRECT%'
+        f"STEP 0: All views in {SCHEMA} schema with SPEND/DIRECT/INDIRECT in name",
+        *query(conn, f"""
+            SELECT view_name FROM all_views
+            WHERE owner = '{SCHEMA}'
+              AND (UPPER(view_name) LIKE '%SPEND%'
+                OR UPPER(view_name) LIKE '%DIRECT%'
+                OR UPPER(view_name) LIKE '%INDIRECT%')
             ORDER BY view_name
         """), file=f
     )
 
-    # Step 1: Schema comparison
+    # Step 1: Schema comparison (using ALL_TAB_COLUMNS with owner filter)
     for vname, label in [(VIEW_1, "View 1 (Direct)"), (VIEW_2, "View 2 (Indirect)")]:
         print_table(
-            f"STEP 1: Columns in {label} ({vname})",
+            f"STEP 1: Columns in {label} ({SCHEMA}.{vname})",
             *query(conn, f"""
                 SELECT column_name, data_type, data_length, nullable, column_id
-                FROM user_tab_columns
-                WHERE table_name = '{vname}'
+                FROM all_tab_columns
+                WHERE owner = '{SCHEMA}' AND table_name = '{vname}'
                 ORDER BY column_id
             """), file=f
         )
@@ -127,10 +133,10 @@ def main():
         f"COMMON COLUMNS (in both {VIEW_1} and {VIEW_2})",
         *query(conn, f"""
             SELECT a.column_name, a.data_type AS type_v1, b.data_type AS type_v2
-            FROM user_tab_columns a
-            JOIN user_tab_columns b ON a.column_name = b.column_name
-            WHERE a.table_name = '{VIEW_1}'
-              AND b.table_name = '{VIEW_2}'
+            FROM all_tab_columns a
+            JOIN all_tab_columns b ON a.column_name = b.column_name
+            WHERE a.owner = '{SCHEMA}' AND a.table_name = '{VIEW_1}'
+              AND b.owner = '{SCHEMA}' AND b.table_name = '{VIEW_2}'
             ORDER BY a.column_id
         """), file=f
     )
@@ -140,10 +146,11 @@ def main():
         f"COLUMNS ONLY IN {VIEW_1} (not in {VIEW_2})",
         *query(conn, f"""
             SELECT column_name, data_type, data_length
-            FROM user_tab_columns
-            WHERE table_name = '{VIEW_1}'
+            FROM all_tab_columns
+            WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}'
               AND column_name NOT IN (
-                SELECT column_name FROM user_tab_columns WHERE table_name = '{VIEW_2}'
+                SELECT column_name FROM all_tab_columns
+                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}'
               )
             ORDER BY column_id
         """), file=f
@@ -154,83 +161,80 @@ def main():
         f"COLUMNS ONLY IN {VIEW_2} (not in {VIEW_1})",
         *query(conn, f"""
             SELECT column_name, data_type, data_length
-            FROM user_tab_columns
-            WHERE table_name = '{VIEW_2}'
+            FROM all_tab_columns
+            WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}'
               AND column_name NOT IN (
-                SELECT column_name FROM user_tab_columns WHERE table_name = '{VIEW_1}'
+                SELECT column_name FROM all_tab_columns
+                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}'
               )
             ORDER BY column_id
         """), file=f
     )
 
-    # Step 2: Row counts
-    for vname in [VIEW_1, VIEW_2]:
+    # Step 2: Row counts (using fully qualified view names)
+    for fq_vname, label in [(FQ_VIEW_1, VIEW_1), (FQ_VIEW_2, VIEW_2)]:
         print_table(
-            f"ROW COUNT: {vname}",
-            *query(conn, f"SELECT COUNT(*) AS total_rows FROM {vname}"), file=f
+            f"ROW COUNT: {fq_vname}",
+            *query(conn, f"SELECT COUNT(*) AS total_rows FROM {fq_vname}"), file=f
         )
-        # Try with date filter
-        try:
-            print_table(
-                f"ROW COUNT (filtered): {vname} WHERE {DATE_FILTER}",
-                *query(conn, f"SELECT COUNT(*) AS filtered_rows FROM {vname} WHERE {DATE_FILTER}"), file=f
-            )
-        except Exception:
-            pass
+        print_table(
+            f"ROW COUNT (filtered): {fq_vname} WHERE {DATE_FILTER}",
+            *query(conn, f"SELECT COUNT(*) AS filtered_rows FROM {fq_vname} WHERE {DATE_FILTER}"), file=f
+        )
 
     # Step 3: Sample data
-    for vname, label in [(VIEW_1, "Direct"), (VIEW_2, "Indirect")]:
+    for fq_vname, label in [(FQ_VIEW_1, "Direct"), (FQ_VIEW_2, "Indirect")]:
         print_table(
-            f"SAMPLE DATA: {vname} (first 3 rows)",
-            *query(conn, f"SELECT * FROM {vname} FETCH FIRST 3 ROWS ONLY"), file=f
+            f"SAMPLE DATA: {fq_vname} (first 3 rows)",
+            *query(conn, f"SELECT * FROM {fq_vname} FETCH FIRST 3 ROWS ONLY"), file=f
         )
 
     # Step 4: Key column profiling
-    for vname, label in [(VIEW_1, "Direct"), (VIEW_2, "Indirect")]:
+    for fq_vname, label in [(FQ_VIEW_1, "Direct"), (FQ_VIEW_2, "Indirect")]:
         # Amount stats
         print_table(
-            f"AMOUNT STATS: {vname}",
+            f"AMOUNT STATS: {fq_vname}",
             *query(conn, f"""
                 SELECT COUNT(*) AS rows, COUNT(AMOUNT) AS non_null,
                        ROUND(MIN(AMOUNT),2) AS min_amt, ROUND(MAX(AMOUNT),2) AS max_amt,
                        ROUND(SUM(AMOUNT),2) AS sum_amt
-                FROM {vname} WHERE {DATE_FILTER}
+                FROM {fq_vname} WHERE {DATE_FILTER}
             """), file=f
         )
 
         # Region distribution
         print_table(
-            f"REGION distribution: {vname}",
+            f"REGION distribution: {fq_vname}",
             *query(conn, f"""
                 SELECT REGION, COUNT(*) AS cnt,
                        ROUND(SUM(AMOUNT / EXCH_RATE), 2) AS spend_eur
-                FROM {vname} WHERE {DATE_FILTER}
+                FROM {fq_vname} WHERE {DATE_FILTER}
                 GROUP BY REGION ORDER BY spend_eur DESC
             """), file=f
         )
 
         # Country distribution
         print_table(
-            f"COUNTRY distribution: {vname}",
+            f"COUNTRY distribution: {fq_vname}",
             *query(conn, f"""
-                SELECT COUNTRY, COUNT(*) AS cnt FROM {vname}
+                SELECT COUNTRY, COUNT(*) AS cnt FROM {fq_vname}
                 WHERE {DATE_FILTER} GROUP BY COUNTRY ORDER BY cnt DESC
             """), file=f
         )
 
         # Currency
         print_table(
-            f"CURRENCY distribution: {vname}",
+            f"CURRENCY distribution: {fq_vname}",
             *query(conn, f"""
-                SELECT EXCH_CURRENCY, COUNT(*) AS cnt FROM {vname}
+                SELECT EXCH_CURRENCY, COUNT(*) AS cnt FROM {fq_vname}
                 WHERE {DATE_FILTER} GROUP BY EXCH_CURRENCY ORDER BY cnt DESC
             """), file=f
         )
 
         # Date range
         print_table(
-            f"DATE RANGE: {vname}",
-            *query(conn, f"SELECT MIN(INVOICE_DATE) AS min_date, MAX(INVOICE_DATE) AS max_date FROM {vname}"),
+            f"DATE RANGE: {fq_vname}",
+            *query(conn, f"SELECT MIN(INVOICE_DATE) AS min_date, MAX(INVOICE_DATE) AS max_date FROM {fq_vname}"),
             file=f
         )
 
@@ -240,12 +244,12 @@ def main():
             f"{dim} OVERLAP",
             *query(conn, f"""
                 SELECT
-                    (SELECT COUNT(DISTINCT {col}) FROM {VIEW_1} WHERE {DATE_FILTER}) AS direct_count,
-                    (SELECT COUNT(DISTINCT {col}) FROM {VIEW_2} WHERE {DATE_FILTER}) AS indirect_count,
+                    (SELECT COUNT(DISTINCT {col}) FROM {FQ_VIEW_1} WHERE {DATE_FILTER}) AS direct_count,
+                    (SELECT COUNT(DISTINCT {col}) FROM {FQ_VIEW_2} WHERE {DATE_FILTER}) AS indirect_count,
                     (SELECT COUNT(*) FROM (
-                        SELECT DISTINCT {col} FROM {VIEW_1} WHERE {DATE_FILTER}
+                        SELECT DISTINCT {col} FROM {FQ_VIEW_1} WHERE {DATE_FILTER}
                         INTERSECT
-                        SELECT DISTINCT {col} FROM {VIEW_2} WHERE {DATE_FILTER}
+                        SELECT DISTINCT {col} FROM {FQ_VIEW_2} WHERE {DATE_FILTER}
                     )) AS common_count
                 FROM DUAL
             """), file=f
@@ -261,10 +265,10 @@ def main():
                    SUM(DIRECT_SPEND) + SUM(INDIRECT_SPEND) AS TOTAL_SPEND_EUR
             FROM (
                 SELECT REGION, ROUND(AMOUNT / EXCH_RATE, 2) AS DIRECT_SPEND, 0 AS INDIRECT_SPEND
-                FROM {VIEW_1} WHERE {DATE_FILTER}
+                FROM {FQ_VIEW_1} WHERE {DATE_FILTER}
                 UNION ALL
                 SELECT REGION, 0 AS DIRECT_SPEND, ROUND(AMOUNT / EXCH_RATE, 2) AS INDIRECT_SPEND
-                FROM {VIEW_2} WHERE {DATE_FILTER}
+                FROM {FQ_VIEW_2} WHERE {DATE_FILTER}
             ) combined
             GROUP BY REGION
             ORDER BY TOTAL_SPEND_EUR DESC
@@ -280,7 +284,7 @@ def main():
             old_conn = connect_old()
             print("Connected to old instance!\n")
 
-            # Old view schema
+            # Old view schema (old instance uses user_tab_columns — view is in user's own schema)
             print_table(
                 f"OLD VIEW: Columns in {OLD_VIEW} (old instance)",
                 *query(old_conn, f"""
@@ -311,12 +315,12 @@ def main():
             # Re-connect to new instance to get new view columns for comparison
             new_conn = connect()
             _, v1_cols = query(new_conn, f"""
-                SELECT column_name FROM user_tab_columns
-                WHERE table_name = '{VIEW_1}' ORDER BY column_id
+                SELECT column_name FROM all_tab_columns
+                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}' ORDER BY column_id
             """)
             _, v2_cols = query(new_conn, f"""
-                SELECT column_name FROM user_tab_columns
-                WHERE table_name = '{VIEW_2}' ORDER BY column_id
+                SELECT column_name FROM all_tab_columns
+                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}' ORDER BY column_id
             """)
             v1_col_set = {r[0] for r in v1_cols}
             v2_col_set = {r[0] for r in v2_cols}
@@ -369,11 +373,11 @@ def main():
             new_conn = connect()
             _, v1_spend = query(new_conn, f"""
                 SELECT ROUND(SUM(AMOUNT / EXCH_RATE), 2) AS total_spend_eur
-                FROM {VIEW_1} WHERE {DATE_FILTER}
+                FROM {FQ_VIEW_1} WHERE {DATE_FILTER}
             """)
             _, v2_spend = query(new_conn, f"""
                 SELECT ROUND(SUM(AMOUNT / EXCH_RATE), 2) AS total_spend_eur
-                FROM {VIEW_2} WHERE {DATE_FILTER}
+                FROM {FQ_VIEW_2} WHERE {DATE_FILTER}
             """)
             new_conn.close()
 
