@@ -67,6 +67,20 @@ def query(conn, sql):
         cur.close()
 
 
+def query_columns_fallback(conn, fq_view):
+    """Get column names by querying the view directly (fallback if all_tab_columns returns nothing)."""
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT * FROM {fq_view} WHERE 1=0")
+        cols = [d[0] for d in cur.description]
+        rows = [(c, "", "", "", i+1) for i, c in enumerate(cols)]
+        return ["COLUMN_NAME", "DATA_TYPE", "DATA_LENGTH", "NULLABLE", "COLUMN_ID"], rows
+    except Exception as e:
+        return ["ERROR"], [(str(e),)]
+    finally:
+        cur.close()
+
+
 def print_table(title, cols, rows, file=None):
     out = f"\n{'='*80}\n{title}\n{'='*80}\n"
     if not rows:
@@ -116,59 +130,58 @@ def main():
         """), file=f
     )
 
-    # Step 1: Schema comparison (using ALL_TAB_COLUMNS with owner filter)
-    for vname, label in [(VIEW_1, "View 1 (Direct)"), (VIEW_2, "View 2 (Indirect)")]:
-        print_table(
-            f"STEP 1: Columns in {label} ({SCHEMA}.{vname})",
-            *query(conn, f"""
-                SELECT column_name, data_type, data_length, nullable, column_id
-                FROM all_tab_columns
-                WHERE owner = '{SCHEMA}' AND table_name = '{vname}'
-                ORDER BY column_id
-            """), file=f
-        )
-
-    # Common columns
-    print_table(
-        f"COMMON COLUMNS (in both {VIEW_1} and {VIEW_2})",
-        *query(conn, f"""
-            SELECT a.column_name, a.data_type AS type_v1, b.data_type AS type_v2
-            FROM all_tab_columns a
-            JOIN all_tab_columns b ON a.column_name = b.column_name
-            WHERE a.owner = '{SCHEMA}' AND a.table_name = '{VIEW_1}'
-              AND b.owner = '{SCHEMA}' AND b.table_name = '{VIEW_2}'
-            ORDER BY a.column_id
-        """), file=f
-    )
-
-    # Columns only in View 1
-    print_table(
-        f"COLUMNS ONLY IN {VIEW_1} (not in {VIEW_2})",
-        *query(conn, f"""
-            SELECT column_name, data_type, data_length
+    # Step 1: Schema comparison (using ALL_TAB_COLUMNS, with fallback)
+    for vname, fq, label in [(VIEW_1, FQ_VIEW_1, "View 1 (Direct)"), (VIEW_2, FQ_VIEW_2, "View 2 (Indirect)")]:
+        cols, rows = query(conn, f"""
+            SELECT column_name, data_type, data_length, nullable, column_id
             FROM all_tab_columns
-            WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}'
-              AND column_name NOT IN (
-                SELECT column_name FROM all_tab_columns
-                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}'
-              )
+            WHERE owner = '{SCHEMA}' AND table_name = '{vname}'
             ORDER BY column_id
-        """), file=f
-    )
+        """)
+        if not rows or (len(rows) == 1 and cols == ["ERROR"]):
+            print(f"  all_tab_columns returned nothing for {vname}, using fallback...")
+            cols, rows = query_columns_fallback(conn, fq)
+        print_table(f"STEP 1: Columns in {label} ({fq})", cols, rows, file=f)
 
-    # Columns only in View 2
+    # Common columns (via fallback-safe approach)
+    # Get column lists from both views
+    v1_cols_r = query(conn, f"""
+        SELECT column_name FROM all_tab_columns
+        WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}' ORDER BY column_id
+    """)
+    v2_cols_r = query(conn, f"""
+        SELECT column_name FROM all_tab_columns
+        WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}' ORDER BY column_id
+    """)
+    # Fallback if all_tab_columns is empty
+    if not v1_cols_r[1] or (len(v1_cols_r[1]) == 1 and v1_cols_r[0] == ["ERROR"]):
+        _, v1_fb = query_columns_fallback(conn, FQ_VIEW_1)
+        v1_col_names = [r[0] for r in v1_fb]
+    else:
+        v1_col_names = [r[0] for r in v1_cols_r[1]]
+    if not v2_cols_r[1] or (len(v2_cols_r[1]) == 1 and v2_cols_r[0] == ["ERROR"]):
+        _, v2_fb = query_columns_fallback(conn, FQ_VIEW_2)
+        v2_col_names = [r[0] for r in v2_fb]
+    else:
+        v2_col_names = [r[0] for r in v2_cols_r[1]]
+
+    v1_set = set(v1_col_names)
+    v2_set = set(v2_col_names)
+    common = sorted(v1_set & v2_set)
+    only_v1 = sorted(v1_set - v2_set)
+    only_v2 = sorted(v2_set - v1_set)
+
     print_table(
-        f"COLUMNS ONLY IN {VIEW_2} (not in {VIEW_1})",
-        *query(conn, f"""
-            SELECT column_name, data_type, data_length
-            FROM all_tab_columns
-            WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}'
-              AND column_name NOT IN (
-                SELECT column_name FROM all_tab_columns
-                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}'
-              )
-            ORDER BY column_id
-        """), file=f
+        f"COMMON COLUMNS ({len(common)} columns in both views)",
+        ["COLUMN_NAME"], [(c,) for c in common], file=f
+    )
+    print_table(
+        f"COLUMNS ONLY IN {VIEW_1} ({len(only_v1)} columns)",
+        ["COLUMN_NAME"], [(c,) for c in only_v1], file=f
+    )
+    print_table(
+        f"COLUMNS ONLY IN {VIEW_2} ({len(only_v2)} columns)",
+        ["COLUMN_NAME"], [(c,) for c in only_v2], file=f
     )
 
     # Step 2: Row counts (using fully qualified view names)
@@ -306,26 +319,19 @@ def main():
             )
 
             # Columns in old view — fetch for cross-comparison
+            # Try user_tab_columns first, fallback to querying the view directly
             _, old_cols = query(old_conn, f"""
                 SELECT column_name FROM user_tab_columns
                 WHERE table_name = '{OLD_VIEW}' ORDER BY column_id
             """)
+            if not old_cols or (len(old_cols) == 1 and old_cols[0] == ("ERROR",)):
+                _, old_cols = query_columns_fallback(old_conn, OLD_VIEW)
             old_col_set = {r[0] for r in old_cols}
 
-            # Re-connect to new instance to get new view columns for comparison
-            new_conn = connect()
-            _, v1_cols = query(new_conn, f"""
-                SELECT column_name FROM all_tab_columns
-                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_1}' ORDER BY column_id
-            """)
-            _, v2_cols = query(new_conn, f"""
-                SELECT column_name FROM all_tab_columns
-                WHERE owner = '{SCHEMA}' AND table_name = '{VIEW_2}' ORDER BY column_id
-            """)
-            v1_col_set = {r[0] for r in v1_cols}
-            v2_col_set = {r[0] for r in v2_cols}
+            # Reuse v1_set / v2_set from Step 1 (already computed above)
+            v1_col_set = v1_set
+            v2_col_set = v2_set
             new_all_cols = v1_col_set | v2_col_set
-            new_conn.close()
 
             # Columns in old view but NOT in either new view
             old_only = sorted(old_col_set - new_all_cols)
@@ -370,16 +376,16 @@ def main():
             """)
             old_conn.close()
 
-            new_conn = connect()
-            _, v1_spend = query(new_conn, f"""
+            new_conn2 = connect()
+            _, v1_spend = query(new_conn2, f"""
                 SELECT ROUND(SUM(AMOUNT / EXCH_RATE), 2) AS total_spend_eur
                 FROM {FQ_VIEW_1} WHERE {DATE_FILTER}
             """)
-            _, v2_spend = query(new_conn, f"""
+            _, v2_spend = query(new_conn2, f"""
                 SELECT ROUND(SUM(AMOUNT / EXCH_RATE), 2) AS total_spend_eur
                 FROM {FQ_VIEW_2} WHERE {DATE_FILTER}
             """)
-            new_conn.close()
+            new_conn2.close()
 
             title = "SPEND COMPARISON: Old View vs New Views Combined"
             out = f"\n{'='*80}\n{title}\n{'='*80}\n"
